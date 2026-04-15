@@ -17,9 +17,10 @@ from util.misc import NativeScalerWithGradNormCount as NativeScaler
 from util.loader import CachedFolder
 
 from models.vae import AutoencoderKL
-from models import mar
-from engine_mar import train_one_epoch, evaluate
+from models import aura_mar
+from engine_aura_mar import train_one_epoch, evaluate
 import copy
+from safetensors.torch import load_file as load_safetensors # 增加这一行
 
 def get_args_parser():
     parser = argparse.ArgumentParser('MAR training with Diffusion Loss', add_help=False)
@@ -129,6 +130,28 @@ def get_args_parser():
     parser.set_defaults(use_cached=False)
     parser.add_argument('--cached_path', default='', help='path to cached latents')
 
+
+
+    # 新增你的 AURA 参数
+    parser.add_argument('--verifier_hidden_dim', type=int, default=256)
+    parser.add_argument('--verifier_num_layers', type=int, default=2)
+    parser.add_argument('--gate_tau', type=float, default=0.5)
+    parser.add_argument('--difficulty_alpha', type=float, default=1.0)
+    parser.add_argument('--difficulty_beta', type=float, default=1.0)
+    parser.add_argument('--difficulty_gamma', type=float, default=1.0)
+    parser.add_argument('--tau_d_low', type=float, default=...)
+    parser.add_argument('--tau_d_high', type=float, default=...)
+    parser.add_argument('--tau_v_high', type=float, default=...)
+    parser.add_argument('--tau_v_low', type=float, default=...)
+    parser.add_argument('--tau_v_keep', type=float, default=...)
+    parser.add_argument('--tau_v_revise', type=float, default=...)
+    parser.add_argument('--tau_drift', type=float, default=...)
+    parser.add_argument('--window_radius', type=int, default=1)
+    parser.add_argument('--topk_windows', type=int, default=8)
+    parser.add_argument('--rerank_K', type=int, default=3)
+    parser.add_argument('--delta_V', type=float, default=0.01)
+    parser.add_argument('--lambda_ver', type=float, default=1.0)
+    parser.add_argument('--lambda_rank', type=float, default=0.1)
     return parser
 
 
@@ -188,7 +211,7 @@ def main(args):
     for param in vae.parameters():
         param.requires_grad = False
 
-    model = mar.__dict__[args.model](
+    model = aura_mar.__dict__[args.model](
         img_size=args.img_size,
         vae_stride=args.vae_stride,
         patch_size=args.patch_size,
@@ -233,27 +256,52 @@ def main(args):
     print(optimizer)
     loss_scaler = NativeScaler()
 
-    # resume training
-    if args.resume and os.path.exists(os.path.join(args.resume, "checkpoint-last.pth")):
-        checkpoint = torch.load(os.path.join(args.resume, "checkpoint-last.pth"), map_location='cpu')
-        model_without_ddp.load_state_dict(checkpoint['model'])
-        model_params = list(model_without_ddp.parameters())
-        ema_state_dict = checkpoint['model_ema']
-        ema_params = [ema_state_dict[name].cuda() for name, _ in model_without_ddp.named_parameters()]
-        print("Resume checkpoint %s" % args.resume)
 
+    # resume training / load evaluation weights
+    if args.resume and os.path.isfile(args.resume):
+        print(f"Loading weights from: {args.resume}")
+        
+        # 1. 根据后缀选择加载器
+        if args.resume.endswith('.safetensors'):
+            checkpoint = load_safetensors(args.resume)
+        else:
+            checkpoint = torch.load(args.resume, map_location='cpu')
+
+        # 2. 提取状态字典 (处理官方 checkpoint 或 纯权重文件)
+        if 'model' in checkpoint:
+            model_state_dict = checkpoint['model']
+            ema_state_dict = checkpoint.get('model_ema', None)
+        else:
+            # 如果是纯权重文件，直接作为模型字典
+            model_state_dict = checkpoint
+            ema_state_dict = None
+
+        # 3. 加载到模型
+        msg = model_without_ddp.load_state_dict(model_state_dict, strict=False)
+        print(f"Model load message: {msg}")
+
+        # 4. 处理 EMA 参数 (推理时关键)
+        model_params = list(model_without_ddp.parameters())
+        if ema_state_dict is not None:
+            ema_params = [ema_state_dict[name].cuda() for name, _ in model_without_ddp.named_parameters()]
+            print("Loaded EMA parameters from checkpoint.")
+        else:
+            # 如果权重里没带 EMA，则用当前模型参数初始化 EMA，防止 evaluate 时报错
+            ema_params = copy.deepcopy(model_params)
+            print("No EMA found in checkpoint, using model weights for EMA.")
+
+        # 5. 加载优化器等状态 (仅用于断点续训)
         if 'optimizer' in checkpoint and 'epoch' in checkpoint:
             optimizer.load_state_dict(checkpoint['optimizer'])
             args.start_epoch = checkpoint['epoch'] + 1
             if 'scaler' in checkpoint:
                 loss_scaler.load_state_dict(checkpoint['scaler'])
-            print("With optim & sched!")
-        del checkpoint
+            print("Optimizer and scaler loaded.")
+        
     else:
         model_params = list(model_without_ddp.parameters())
         ema_params = copy.deepcopy(model_params)
-        print("Training from scratch")
-
+        print("Warning: No valid checkpoint found at --resume path. Training from scratch!")
 
         
 
