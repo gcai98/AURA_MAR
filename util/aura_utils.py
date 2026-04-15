@@ -18,3 +18,19 @@ def safe_topk(scores, k, dim=-1):
         empty = scores.narrow(dim, 0, 0)
         return empty, torch.empty_like(empty, dtype=torch.long)
     return torch.topk(scores, k, dim=dim)
+
+
+def safe_normalize(values, eps=1e-6):
+    min_value = values.amin(dim=-1, keepdim=True)
+    max_value = values.amax(dim=-1, keepdim=True)
+    scale = (max_value - min_value).clamp_min(eps)
+    return (values - min_value) / scale
+
+
+def masked_mean(values, mask=None, eps=1e-6):
+    if mask is None:
+        return values.mean()
+    mask = mask.to(values.dtype)
+    total = (values * mask).sum()
+    denom = mask.sum().clamp_min(eps)
+    return total / denom

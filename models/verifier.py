@@ -96,5 +96,8 @@ def fast_accept_score(uncertainty, instability=None, inconsistency=None, alpha=1
     uncertainty = _coerce_tensor(uncertainty)
     instability = _coerce_tensor(0.0 if instability is None else instability, reference=uncertainty)
     inconsistency = _coerce_tensor(0.0 if inconsistency is None else inconsistency, reference=uncertainty)
-    penalty = alpha * uncertainty.abs() + beta * instability.abs() + gamma * inconsistency.abs()
-    return torch.exp(-penalty)
+    uncertainty = uncertainty.clamp_min(0.0)
+    instability = instability.clamp_min(0.0)
+    inconsistency = inconsistency.clamp_min(0.0)
+    penalty = alpha * uncertainty + beta * instability + gamma * inconsistency
+    return torch.exp(-penalty).clamp(0.0, 1.0)

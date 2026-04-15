@@ -30,6 +30,7 @@ aura_mar_huge
 
 也就是说，这个文件以后会成为你的主模型文件。
 '''
+import math
 from functools import partial
 
 import torch
@@ -38,6 +39,7 @@ import torch.nn as nn
 from models.difficulty import (
     compute_cond_inconsistency,
     compute_difficulty as combine_difficulty,
+    compute_gating_score,
     compute_instability,
     compute_local_inconsistency,
     compute_uncertainty,
@@ -50,6 +52,7 @@ from models.rerank import (
     select_topk_window_centers,
 )
 from models.verifier import LightweightVerifier, fast_accept_score
+from util.aura_utils import masked_mean
 
 
 class AURAMAR(MAR):
@@ -103,6 +106,7 @@ class AURAMAR(MAR):
             hidden_dim=verifier_hidden_dim,
             num_layers=verifier_num_layers,
         )
+        self.last_aura_stats = []
 
     def compute_difficulty(self, token_state, previous_state=None, reference_state=None):
         uncertainty = compute_uncertainty(token_state)
@@ -126,25 +130,29 @@ class AURAMAR(MAR):
             'cond_inconsistency': cond_inconsistency,
         }
 
-    def build_verifier_inputs(self, token_state, difficulty_pack, mask=None):
-        del token_state
+    def build_verifier_inputs(self, token_state, difficulty_pack, mask=None, step_ratio=None):
+        token_norm = token_state.pow(2).mean(dim=-1).sqrt()
         difficulty = difficulty_pack['difficulty']
         if mask is None:
             mask_feature = torch.zeros_like(difficulty)
         else:
             mask_feature = mask.to(difficulty.dtype)
+        if step_ratio is None:
+            step_feature = torch.zeros_like(difficulty)
+        else:
+            step_feature = torch.full_like(difficulty, float(step_ratio))
 
         return torch.stack(
             [
                 difficulty,
                 difficulty_pack['uncertainty'],
-                difficulty_pack['instability'],
-                mask_feature,
+                0.5 * (difficulty_pack['instability'] + difficulty_pack['local_inconsistency']),
+                0.5 * mask_feature + 0.5 * step_feature + 0.1 * token_norm,
             ],
             dim=-1,
         )
 
-    def decide_actions(self, difficulty_pack, verifier_scores=None):
+    def decide_actions(self, difficulty_pack, verifier_scores=None, active_mask=None):
         difficulty = difficulty_pack['difficulty']
         if verifier_scores is None:
             verifier_scores = fast_accept_score(
@@ -152,20 +160,60 @@ class AURAMAR(MAR):
                 difficulty_pack['instability'],
                 difficulty_pack['local_inconsistency'],
             )
+        gating_score = compute_gating_score(
+            difficulty,
+            accept_score=verifier_scores,
+            gate_tau=self.gate_tau,
+            uncertainty=difficulty_pack['uncertainty'],
+        )
 
         easy = difficulty <= self.tau_d_low
         hard = difficulty >= self.tau_d_high
-        keep = easy | (verifier_scores >= self.tau_v_keep)
-        revise = hard & (verifier_scores <= self.tau_v_revise)
-        accept = ~(keep | revise)
-        gated = difficulty >= self.gate_tau
+        low_uncertainty = difficulty_pack['uncertainty'] <= self.tau_d_low
+        high_uncertainty = difficulty_pack['uncertainty'] >= self.tau_d_high
+        strong_accept = verifier_scores >= self.tau_v_keep
+        weak_accept = verifier_scores >= self.tau_v_high
+        weak_reject = verifier_scores <= self.tau_v_low
+        strong_reject = verifier_scores <= self.tau_v_revise
+
+        keep = easy & low_uncertainty & strong_accept
+        revise = hard & high_uncertainty & strong_reject
+        accept = (~keep) & (~revise) & (weak_accept | (~weak_reject))
+        gated = gating_score >= 0
+
+        if active_mask is not None:
+            active_mask = active_mask.to(torch.bool)
+            keep = keep & active_mask
+            revise = revise & active_mask
+            accept = accept & active_mask
+            gated = gated & active_mask
+
+        fallback_accept = active_mask if active_mask is not None else torch.ones_like(accept, dtype=torch.bool)
+        unresolved = ~(keep | revise | accept)
+        accept = accept | (unresolved & fallback_accept)
 
         return {
             'keep': keep,
             'accept': accept,
             'revise': revise,
             'gated': gated,
+            'gating_score': gating_score,
             'verifier_scores': verifier_scores,
+        }
+
+    def summarize_step_stats(self, step, num_iter, difficulty_pack, action_pack, active_mask):
+        return {
+            'step': float(step),
+            'step_ratio': float(step + 1) / float(max(num_iter, 1)),
+            'difficulty_mean': float(masked_mean(difficulty_pack['difficulty'], active_mask)),
+            'uncertainty_mean': float(masked_mean(difficulty_pack['uncertainty'], active_mask)),
+            'instability_mean': float(masked_mean(difficulty_pack['instability'], active_mask)),
+            'local_inconsistency_mean': float(masked_mean(difficulty_pack['local_inconsistency'], active_mask)),
+            'verifier_mean': float(masked_mean(action_pack['verifier_scores'], active_mask)),
+            'gating_mean': float(masked_mean(action_pack['gating_score'], active_mask)),
+            'keep_ratio': float(masked_mean(action_pack['keep'].to(difficulty_pack['difficulty'].dtype), active_mask)),
+            'accept_ratio': float(masked_mean(action_pack['accept'].to(difficulty_pack['difficulty'].dtype), active_mask)),
+            'revise_ratio': float(masked_mean(action_pack['revise'].to(difficulty_pack['difficulty'].dtype), active_mask)),
         }
 
     def select_hard_windows(self, difficulty):
@@ -190,8 +238,130 @@ class AURAMAR(MAR):
         _ = score_window_candidates(candidates[:self.rerank_K])
         return tokens
 
-    def sample_tokens_aura(self, *args, **kwargs):
-        return super().sample_tokens(*args, **kwargs)
+    def forward_backbone_step(self, tokens, mask, class_embedding):
+        x = self.forward_mae_encoder(tokens, mask, class_embedding)
+        z = self.forward_mae_decoder(x, mask)
+        return z
+
+    def _compute_next_mask(self, step, num_iter, mask, orders, bsz):
+        mask_ratio = torch.tensor(
+            [math.cos(math.pi / 2.0 * (step + 1) / num_iter)],
+            device=mask.device,
+        )
+        mask_len = torch.floor(mask_ratio * self.seq_len)
+        mask_len = torch.maximum(
+            torch.ones_like(mask_len),
+            torch.minimum(mask.sum(dim=-1, keepdim=True) - 1, mask_len),
+        )
+        mask_len_value = int(mask_len[0].item())
+        mask_next = torch.zeros(bsz, self.seq_len, device=mask.device)
+        mask_next = torch.scatter(
+            mask_next,
+            dim=-1,
+            index=orders[:, :mask_len_value],
+            src=torch.ones_like(mask_next),
+        ).bool()
+        return mask_len, mask_next
+
+    def sample_tokens_aura(self, bsz, num_iter=64, cfg=1.0, cfg_schedule="linear", labels=None, temperature=1.0, progress=False):
+        mask = torch.ones(bsz, self.seq_len).cuda()
+        tokens = torch.zeros(bsz, self.seq_len, self.token_embed_dim).cuda()
+        orders = self.sample_orders(bsz)
+        previous_tokens = None
+        self.last_aura_stats = []
+
+        indices = list(range(num_iter))
+        if progress:
+            from tqdm import tqdm
+            indices = tqdm(indices)
+
+        for step in indices:
+            cur_tokens = tokens.clone()
+
+            if labels is not None:
+                class_embedding = self.class_emb(labels)
+            else:
+                class_embedding = self.fake_latent.repeat(bsz, 1)
+
+            model_tokens = tokens
+            model_mask = mask
+            if not cfg == 1.0:
+                model_tokens = torch.cat([tokens, tokens], dim=0)
+                class_embedding = torch.cat([class_embedding, self.fake_latent.repeat(bsz, 1)], dim=0)
+                model_mask = torch.cat([mask, mask], dim=0)
+
+            z_full = self.forward_backbone_step(model_tokens, model_mask, class_embedding)
+            mask_len, mask_next = self._compute_next_mask(step, num_iter, mask, orders, bsz)
+
+            if step >= num_iter - 1:
+                mask_to_pred = mask.bool()
+            else:
+                mask_to_pred = torch.logical_xor(mask.bool(), mask_next.bool())
+
+            sample_mask = mask_to_pred
+            if not cfg == 1.0:
+                sample_mask = torch.cat([mask_to_pred, mask_to_pred], dim=0)
+
+            z_samples = z_full[sample_mask.nonzero(as_tuple=True)]
+            if cfg_schedule == "linear":
+                cfg_iter = 1 + (cfg - 1) * (self.seq_len - mask_len[0]) / self.seq_len
+            elif cfg_schedule == "constant":
+                cfg_iter = cfg
+            else:
+                raise NotImplementedError
+
+            sampled_token_latent = self.diffloss.sample(z_samples, temperature, cfg_iter)
+            if not cfg == 1.0:
+                sampled_token_latent, _ = sampled_token_latent.chunk(2, dim=0)
+
+            cur_tokens[mask_to_pred.nonzero(as_tuple=True)] = sampled_token_latent
+
+            active_mask = mask_to_pred
+            difficulty_pack = self.compute_difficulty(
+                cur_tokens,
+                previous_state=previous_tokens,
+                reference_state=tokens,
+            )
+            verifier_inputs = self.build_verifier_inputs(
+                cur_tokens,
+                difficulty_pack,
+                mask=active_mask,
+                step_ratio=float(step + 1) / float(max(num_iter, 1)),
+            )
+            verifier_scores = torch.sigmoid(
+                self.verifier(verifier_inputs.reshape(-1, verifier_inputs.shape[-1]))
+            ).reshape_as(difficulty_pack['difficulty'])
+            fast_scores = fast_accept_score(
+                difficulty_pack['uncertainty'],
+                difficulty_pack['instability'],
+                difficulty_pack['local_inconsistency'],
+                alpha=self.difficulty_alpha,
+                beta=self.difficulty_beta,
+                gamma=self.difficulty_gamma,
+            )
+            combined_scores = 0.5 * verifier_scores + 0.5 * fast_scores
+            action_pack = self.decide_actions(
+                difficulty_pack,
+                verifier_scores=combined_scores,
+                active_mask=active_mask,
+            )
+
+            keep_mask = action_pack['keep']
+            revise_mask = action_pack['revise']
+            if previous_tokens is not None:
+                cur_tokens[keep_mask.nonzero(as_tuple=True)] = previous_tokens[keep_mask.nonzero(as_tuple=True)]
+                cur_tokens[revise_mask.nonzero(as_tuple=True)] = tokens[revise_mask.nonzero(as_tuple=True)]
+            cur_tokens = self.apply_local_reranking(cur_tokens, difficulty=difficulty_pack['difficulty'])
+
+            previous_tokens = tokens.clone()
+            tokens = cur_tokens.clone()
+            mask = mask_next.float()
+            self.last_aura_stats.append(
+                self.summarize_step_stats(step, num_iter, difficulty_pack, action_pack, active_mask)
+            )
+
+        tokens = self.unpatchify(tokens)
+        return tokens
 
     def forward(self, imgs, labels):
         loss_mar = super().forward(imgs, labels)
@@ -222,6 +392,12 @@ class AURAMAR(MAR):
                 'difficulty_mean': difficulty_pack['difficulty'].mean(),
                 'verifier_mean': verifier_scores.mean(),
                 'fast_accept_mean': fast_scores.mean(),
+                'gating_mean': compute_gating_score(
+                    difficulty_pack['difficulty'],
+                    accept_score=fast_scores,
+                    gate_tau=self.gate_tau,
+                    uncertainty=difficulty_pack['uncertainty'],
+                ).mean(),
             },
         }
 

@@ -16,19 +16,20 @@ compute_gating_score(...)
 '''
 import torch
 
-from util.aura_utils import reduce_feature_dim
+from util.aura_utils import reduce_feature_dim, safe_normalize
 
 
 def compute_uncertainty(values):
     centered = values - values.mean(dim=-1, keepdim=True)
-    return reduce_feature_dim(centered.abs())
+    variance = reduce_feature_dim(centered.pow(2))
+    return variance.sqrt()
 
 
 def compute_instability(values, previous_values=None):
     if previous_values is None:
         return torch.zeros_like(reduce_feature_dim(values))
     delta = values - previous_values
-    return reduce_feature_dim(delta.abs())
+    return reduce_feature_dim(delta.pow(2)).sqrt()
 
 
 def compute_local_inconsistency(values):
@@ -36,14 +37,14 @@ def compute_local_inconsistency(values):
         return torch.zeros_like(reduce_feature_dim(values))
     left = torch.roll(values, shifts=1, dims=1)
     right = torch.roll(values, shifts=-1, dims=1)
-    inconsistency = 0.5 * (values - left).abs() + 0.5 * (values - right).abs()
-    return reduce_feature_dim(inconsistency)
+    inconsistency = 0.5 * (values - left).pow(2) + 0.5 * (values - right).pow(2)
+    return reduce_feature_dim(inconsistency).sqrt()
 
 
 def compute_cond_inconsistency(values, reference_values=None):
     if reference_values is None:
         return torch.zeros_like(reduce_feature_dim(values))
-    return reduce_feature_dim((values - reference_values).abs())
+    return reduce_feature_dim((values - reference_values).pow(2)).sqrt()
 
 
 def compute_difficulty(
@@ -57,13 +58,13 @@ def compute_difficulty(
 ):
     components = []
     if uncertainty is not None:
-        components.append(alpha * uncertainty)
+        components.append(alpha * safe_normalize(uncertainty))
     if instability is not None:
-        components.append(beta * instability)
+        components.append(beta * safe_normalize(instability))
     if local_inconsistency is not None:
-        components.append(gamma * local_inconsistency)
+        components.append(gamma * safe_normalize(local_inconsistency))
     if cond_inconsistency is not None:
-        components.append(gamma * cond_inconsistency)
+        components.append(gamma * safe_normalize(cond_inconsistency))
 
     if not components:
         raise ValueError("At least one difficulty component must be provided.")
@@ -71,10 +72,12 @@ def compute_difficulty(
     total = components[0]
     for component in components[1:]:
         total = total + component
-    return total
+    return safe_normalize(total)
 
 
-def compute_gating_score(difficulty, accept_score=None, gate_tau=0.5):
+def compute_gating_score(difficulty, accept_score=None, gate_tau=0.5, uncertainty=None):
     if accept_score is None:
         accept_score = torch.ones_like(difficulty)
-    return accept_score - difficulty - gate_tau
+    if uncertainty is None:
+        uncertainty = torch.zeros_like(difficulty)
+    return accept_score - difficulty - 0.5 * safe_normalize(uncertainty) - gate_tau
