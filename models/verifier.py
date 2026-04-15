@@ -55,3 +55,46 @@ c)
 
 这样 aura_mar.py 只负责“调度”，而不把 verifier 网络细节全塞进去。
 '''
+import torch
+import torch.nn as nn
+
+
+def _coerce_tensor(value, reference=None):
+    if isinstance(value, torch.Tensor):
+        return value
+    kwargs = {}
+    if isinstance(reference, torch.Tensor):
+        kwargs['device'] = reference.device
+        kwargs['dtype'] = reference.dtype
+    return torch.as_tensor(value, **kwargs)
+
+
+class LightweightVerifier(nn.Module):
+    def __init__(self, input_dim=4, hidden_dim=128, num_layers=2, dropout=0.0):
+        super().__init__()
+        hidden_dim = max(1, int(hidden_dim))
+        num_layers = max(1, int(num_layers))
+
+        layers = []
+        in_dim = input_dim
+        for _ in range(num_layers - 1):
+            layers.append(nn.Linear(in_dim, hidden_dim))
+            layers.append(nn.GELU())
+            if dropout > 0:
+                layers.append(nn.Dropout(dropout))
+            in_dim = hidden_dim
+        layers.append(nn.Linear(in_dim, 1))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        if x.ndim == 1:
+            x = x.unsqueeze(0)
+        return self.net(x).squeeze(-1)
+
+
+def fast_accept_score(uncertainty, instability=None, inconsistency=None, alpha=1.0, beta=1.0, gamma=1.0):
+    uncertainty = _coerce_tensor(uncertainty)
+    instability = _coerce_tensor(0.0 if instability is None else instability, reference=uncertainty)
+    inconsistency = _coerce_tensor(0.0 if inconsistency is None else inconsistency, reference=uncertainty)
+    penalty = alpha * uncertainty.abs() + beta * instability.abs() + gamma * inconsistency.abs()
+    return torch.exp(-penalty)

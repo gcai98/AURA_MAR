@@ -1,6 +1,6 @@
 import math
 import sys
-from typing import Iterable
+from typing import Dict, Iterable
 
 import torch
 
@@ -27,6 +27,45 @@ def update_ema(target_params, source_params, rate=0.99):
     """
     for targ, src in zip(target_params, source_params):
         targ.detach().mul_(rate).add_(src, alpha=1 - rate)
+
+
+def _to_log_value(value):
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 1:
+            return value.detach().item()
+        return value.detach().mean().item()
+    return float(value)
+
+
+def _parse_model_output(output):
+    if isinstance(output, torch.Tensor):
+        return output, {}
+
+    if not isinstance(output, dict):
+        raise TypeError("Model output must be a tensor or a dict of losses and metrics.")
+
+    loss = output.get('loss_total', output.get('loss'))
+    if not isinstance(loss, torch.Tensor):
+        raise TypeError("Model output dict must include a tensor under 'loss_total'.")
+
+    log_values: Dict[str, float] = {}
+    for key in ('loss_mar', 'loss_ver', 'loss_rank'):
+        value = _to_log_value(output.get(key))
+        if value is not None:
+            log_values[key] = value
+
+    metrics = output.get('metrics')
+    if metrics is not None:
+        if not isinstance(metrics, dict):
+            raise TypeError("Model output 'metrics' must be a dict when provided.")
+        for key, value in metrics.items():
+            metric_value = _to_log_value(value)
+            if metric_value is not None:
+                log_values[f'metric_{key}'] = metric_value
+
+    return loss, log_values
 
 
 def train_one_epoch(model, vae,
@@ -66,7 +105,8 @@ def train_one_epoch(model, vae,
 
         # forward
         with torch.cuda.amp.autocast():
-            loss = model(x, labels)
+            model_output = model(x, labels)
+            loss, extra_metrics = _parse_model_output(model_output)
 
         loss_value = loss.item()
 
@@ -82,11 +122,16 @@ def train_one_epoch(model, vae,
         update_ema(ema_params, model_params, rate=args.ema_rate)
 
         metric_logger.update(loss=loss_value)
+        for name, value in extra_metrics.items():
+            metric_logger.update(**{name: value})
 
         lr = optimizer.param_groups[0]["lr"]
         metric_logger.update(lr=lr)
 
         loss_value_reduce = misc.all_reduce_mean(loss_value)
+        extra_metrics_reduce = {
+            name: misc.all_reduce_mean(value) for name, value in extra_metrics.items()
+        }
         if log_writer is not None:
             """ We use epoch_1000x as the x-axis in tensorboard.
             This calibrates different curves when batch size changes.
@@ -94,6 +139,8 @@ def train_one_epoch(model, vae,
             epoch_1000x = int((data_iter_step / len(data_loader) + epoch) * 1000)
             log_writer.add_scalar('train_loss', loss_value_reduce, epoch_1000x)
             log_writer.add_scalar('lr', lr, epoch_1000x)
+            for name, value in extra_metrics_reduce.items():
+                log_writer.add_scalar(f'train_{name}', value, epoch_1000x)
 
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()

@@ -20,16 +20,16 @@ from models.vae import AutoencoderKL
 from models import aura_mar
 from engine_aura_mar import train_one_epoch, evaluate
 import copy
-from safetensors.torch import load_file as load_safetensors # 增加这一行
 
 def get_args_parser():
-    parser = argparse.ArgumentParser('MAR training with Diffusion Loss', add_help=False)
+    parser = argparse.ArgumentParser('AURA-MAR training with Diffusion Loss', add_help=False)
     parser.add_argument('--batch_size', default=16, type=int,
                         help='Batch size per GPU (effective batch size is batch_size * # gpus')
     parser.add_argument('--epochs', default=400, type=int)
 
     # Model parameters
-    parser.add_argument('--model', default='mar_large', type=str, metavar='MODEL',
+    parser.add_argument('--model', default='aura_mar_large', type=str, metavar='MODEL',
+                        choices=('aura_mar_base', 'aura_mar_large', 'aura_mar_huge'),
                         help='Name of model to train')
 
     # VAE parameters
@@ -129,29 +129,47 @@ def get_args_parser():
                         help='Use cached latents')
     parser.set_defaults(use_cached=False)
     parser.add_argument('--cached_path', default='', help='path to cached latents')
+    parser.add_argument('--use_aura_sampling', action='store_true',
+                        help='Enable placeholder AURA sampling hooks.')
+    parser.add_argument('--return_loss_dict', action='store_true',
+                        help='Return a loss dict for AURA-aware logging.')
 
 
 
     # 新增你的 AURA 参数
-    parser.add_argument('--verifier_hidden_dim', type=int, default=256)
+    parser.add_argument('--verifier_hidden_dim', type=int, default=128,
+                        help='Hidden dim for the lightweight verifier.')
     parser.add_argument('--verifier_num_layers', type=int, default=2)
-    parser.add_argument('--gate_tau', type=float, default=0.5)
-    parser.add_argument('--difficulty_alpha', type=float, default=1.0)
-    parser.add_argument('--difficulty_beta', type=float, default=1.0)
-    parser.add_argument('--difficulty_gamma', type=float, default=1.0)
-    parser.add_argument('--tau_d_low', type=float, default=...)
-    parser.add_argument('--tau_d_high', type=float, default=...)
-    parser.add_argument('--tau_v_high', type=float, default=...)
-    parser.add_argument('--tau_v_low', type=float, default=...)
-    parser.add_argument('--tau_v_keep', type=float, default=...)
-    parser.add_argument('--tau_v_revise', type=float, default=...)
-    parser.add_argument('--tau_drift', type=float, default=...)
+    parser.add_argument('--gate_tau', type=float, default=0.5,
+                        help='Generic gating threshold for future AURA policies.')
+    parser.add_argument('--difficulty_alpha', type=float, default=1.0,
+                        help='Weight for uncertainty in difficulty scoring.')
+    parser.add_argument('--difficulty_beta', type=float, default=1.0,
+                        help='Weight for instability in difficulty scoring.')
+    parser.add_argument('--difficulty_gamma', type=float, default=1.0,
+                        help='Weight for inconsistency in difficulty scoring.')
+    parser.add_argument('--tau_d_low', type=float, default=0.25,
+                        help='Low difficulty threshold.')
+    parser.add_argument('--tau_d_high', type=float, default=0.75,
+                        help='High difficulty threshold.')
+    parser.add_argument('--tau_v_high', type=float, default=0.8,
+                        help='High verifier threshold.')
+    parser.add_argument('--tau_v_low', type=float, default=0.2,
+                        help='Low verifier threshold.')
+    parser.add_argument('--tau_v_keep', type=float, default=0.8,
+                        help='Threshold for keep decisions.')
+    parser.add_argument('--tau_v_revise', type=float, default=0.2,
+                        help='Threshold for revise decisions.')
+    parser.add_argument('--tau_drift', type=float, default=0.0,
+                        help='Placeholder drift tolerance.')
     parser.add_argument('--window_radius', type=int, default=1)
-    parser.add_argument('--topk_windows', type=int, default=8)
-    parser.add_argument('--rerank_K', type=int, default=3)
-    parser.add_argument('--delta_V', type=float, default=0.01)
-    parser.add_argument('--lambda_ver', type=float, default=1.0)
-    parser.add_argument('--lambda_rank', type=float, default=0.1)
+    parser.add_argument('--topk_windows', type=int, default=4)
+    parser.add_argument('--rerank_K', type=int, default=1)
+    parser.add_argument('--delta_V', type=float, default=0.0)
+    parser.add_argument('--lambda_ver', type=float, default=0.0,
+                        help='Verifier loss weight. Phase 1 keeps this disabled.')
+    parser.add_argument('--lambda_rank', type=float, default=0.0,
+                        help='Rerank loss weight. Phase 1 keeps this disabled.')
     return parser
 
 
@@ -227,6 +245,27 @@ def main(args):
         num_sampling_steps=args.num_sampling_steps,
         diffusion_batch_mul=args.diffusion_batch_mul,
         grad_checkpointing=args.grad_checkpointing,
+        use_aura_sampling=args.use_aura_sampling,
+        return_loss_dict=args.return_loss_dict,
+        verifier_hidden_dim=args.verifier_hidden_dim,
+        verifier_num_layers=args.verifier_num_layers,
+        gate_tau=args.gate_tau,
+        difficulty_alpha=args.difficulty_alpha,
+        difficulty_beta=args.difficulty_beta,
+        difficulty_gamma=args.difficulty_gamma,
+        tau_d_low=args.tau_d_low,
+        tau_d_high=args.tau_d_high,
+        tau_v_high=args.tau_v_high,
+        tau_v_low=args.tau_v_low,
+        tau_v_keep=args.tau_v_keep,
+        tau_v_revise=args.tau_v_revise,
+        tau_drift=args.tau_drift,
+        window_radius=args.window_radius,
+        topk_windows=args.topk_windows,
+        rerank_K=args.rerank_K,
+        delta_V=args.delta_V,
+        lambda_ver=args.lambda_ver,
+        lambda_rank=args.lambda_rank,
     )
 
     print("Model = %s" % str(model))
@@ -258,14 +297,14 @@ def main(args):
 
 
     # resume training / load evaluation weights
-    if args.resume and os.path.isfile(args.resume):
+    if args.resume and os.path.exists(os.path.join(args.resume, "checkpoint-last.pth")):
         print(f"Loading weights from: {args.resume}")
         
         # 1. 根据后缀选择加载器
-        if args.resume.endswith('.safetensors'):
+        if False:
             checkpoint = load_safetensors(args.resume)
         else:
-            checkpoint = torch.load(args.resume, map_location='cpu')
+            checkpoint = torch.load(os.path.join(args.resume, "checkpoint-last.pth"), map_location='cpu')
 
         # 2. 提取状态字典 (处理官方 checkpoint 或 纯权重文件)
         if 'model' in checkpoint:
@@ -301,7 +340,7 @@ def main(args):
     else:
         model_params = list(model_without_ddp.parameters())
         ema_params = copy.deepcopy(model_params)
-        print("Warning: No valid checkpoint found at --resume path. Training from scratch!")
+        print("Training from scratch")
 
         
 
